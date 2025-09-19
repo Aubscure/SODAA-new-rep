@@ -98,7 +98,7 @@ class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs
                     if (centerY in depthArray.indices && centerX in depthArray[0].indices) {
                         val rawDepthValue = depthArray[centerY][centerX]
                         val scaleFactor = 0.0025f  // Adjust this based on your model
-                        val meters = rawDepthValue * scaleFactor
+                        val meters = 1.0f / (rawDepthValue * scaleFactor)
                         depthLabel = if (meters in 0.5f..5.0f) {
                             String.format("%.1f m (raw %.1f)", meters, rawDepthValue)
                         } else {

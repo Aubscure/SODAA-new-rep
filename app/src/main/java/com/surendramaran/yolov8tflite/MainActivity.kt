@@ -696,7 +696,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     @JvmInline
     private value class RawDepth(val value: Float)
 
-    private inline fun RawDepth.toMeters(): Float = value * DEPTH_SCALE_FACTOR
+    private inline fun RawDepth.toMeters(): Float = 1.0f / (value * DEPTH_SCALE_FACTOR)
 
     private fun updateHud() {
         val det = lastDetectionInferenceTime
