@@ -45,6 +45,7 @@ import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
+private const val DEPTH_SCALE_FACTOR = 0.0025f
 
 class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private lateinit var binding: ActivityMainBinding
@@ -55,7 +56,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private var depthReady = false
     private var cameraReady = false
 
-    private val DEPTH_MODEL_PATH = "depth_model.tflite"
+    private val DEPTH_MODEL_PATH = "Midas-V2_w8a8.tflite"
 
     private var preview: Preview? = null
     private var imageAnalyzer: ImageAnalysis? = null
@@ -77,6 +78,19 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private val totalPipelineSteps = 3;
 
     private lateinit var loadingOverlay: View
+
+    private var depthFrameCounter = 0
+    private val DEPTH_SKIP_INTERVAL = 1 // Safe default, adjust as needed
+
+    // HUD/debug metrics
+    private var lastDetectionInferenceTime: Long = 0L
+    private var lastDepthInferenceTime: Long = 0L
+    private var lastLagMs: Long = 0L
+    private var frameTimestampMs: Long = 0L
+    private var depthSourceTimestampMs: Long = 0L
+    private var lastDetectionFrameTimestampMs: Long = 0L
+
+    
 
     // Data class for region analysis
     private data class RegionAnalysis(
@@ -198,6 +212,8 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             .build()
 
         imageAnalyzer?.setAnalyzer(cameraExecutor) { imageProxy ->
+            // Record a frame timestamp in ms for consistent lag computation
+            frameTimestampMs = System.currentTimeMillis()
             // 1) Ensure buffer is initialized and matches frame size
             if (bitmapBuffer == null ||
                 bitmapBuffer!!.width  != imageProxy.width ||
@@ -253,19 +269,34 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             when (frameStep % totalPipelineSteps) {
                 0 -> {
                     detectionExecutor.execute {
+                        lastDetectionFrameTimestampMs = frameTimestampMs
                         detector?.detect(rotatedBitmap, screenWidth, screenHeight);
                     }
                 }
                 1 -> {
-                    depthExecutor.execute {
-                        val depthResult = depthEstimator?.estimateDepth(rotatedBitmap)
-                        runOnUiThread {
-                            depthResult?.let { result ->
-                                binding.overlay.setDepthMap(result.rawDepthArray)
-                                depthMap = result.rawDepthArray
+                    if (depthFrameCounter % DEPTH_SKIP_INTERVAL == 0) {
+                        depthExecutor.execute {
+                            val startTime = System.currentTimeMillis()
+                            val sourceTs = frameTimestampMs
+                            val depthResult = depthEstimator?.estimateDepth(rotatedBitmap)
+                            val elapsed = System.currentTimeMillis() - startTime
+                            val depthTimestamp = System.currentTimeMillis()
+                            val lag = depthTimestamp - frameTimestampMs
+                            lastDepthInferenceTime = elapsed
+                            lastLagMs = lag
+                            runOnUiThread {
+                                val raw = depthResult?.rawDepthArray
+                                if (raw != null) {
+                                    binding.overlay.setDepthMap(raw)
+                                    depthMap = raw
+                                    depthSourceTimestampMs = sourceTs
+                                }
+                                updateHud()
                             }
+                            Log.d("DEPTH_DEBUG", "Depth inference: ${elapsed}ms, lag from frame: ${lag}ms")
                         }
                     }
+                    depthFrameCounter++
                 }
                 2 -> {
                     runOnUiThread {
@@ -391,8 +422,9 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     // Add these fields to MainActivity (top of class, after other vars)
     private val objectHistory = mutableMapOf<String, ObjectTrack>()
     private val OBJECT_PERSISTENCE_FRAMES = 10
-    private val MOVEMENT_THRESHOLD = 0.08f // normalized movement threshold
+    private val MOVEMENT_THRESHOLD = 0.04f // normalized movement threshold
     private val DEPTH_THRESHOLD = 0.5f // meters
+
 
     data class ObjectTrack(
         val id: String,
@@ -404,25 +436,28 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
 
     override fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long) {
         runOnUiThread {
-            binding.inferenceTime.text = "${inferenceTime}ms"
+            lastDetectionInferenceTime = inferenceTime
+            updateHud()
+            // Filter boxes by distance (0.5m to 5.0m)
+            val filteredBoxes = boundingBoxes
             binding.overlay.apply {
-                setResults(boundingBoxes)
+                setResults(filteredBoxes)
                 invalidate()
             }
 
-            if (boundingBoxes.isNotEmpty()) {
-                val regionAnalysis = analyzeRegions(boundingBoxes)
+            if (filteredBoxes.isNotEmpty()) {
+                val regionAnalysis = analyzeRegions(filteredBoxes)
                 val guidance = generateNavigationGuidance(
                     regionAnalysis.leftOccupied,
                     regionAnalysis.centerOccupied,
                     regionAnalysis.rightOccupied,
                     regionAnalysis.aboveOccupied,
                     regionAnalysis.belowOccupied,
-                    boundingBoxes
+                    filteredBoxes
                 )
 
                 // Object persistence check
-                val shouldSpeak = boundingBoxes.any { box ->
+                val shouldSpeak = filteredBoxes.any { box ->
                     val objectId = box.clsName // Use class+region as ID, or add more info if needed
                     val centerX = (box.x1 + box.x2) / 2f
                     val centerY = (box.y1 + box.y2) / 2f
@@ -430,7 +465,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                         val x = (centerX * (depthArray[0].size - 1)).toInt()
                         val y = (centerY * (depthArray.size - 1)).toInt()
                         if (y in depthArray.indices && x in depthArray[0].indices) {
-                            depthArray[y][x] * 0.0025f
+                            RawDepth(depthArray[y][x]).toMeters()
                         } else null
                     }
 
@@ -457,7 +492,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                 if (guidance != null && guidance != lastSpokenGuidance && shouldSpeak) {
                     lastSpokenGuidance = guidance
                     // Use the primary object's ID for debouncing
-                    val primaryObjectId = boundingBoxes.firstOrNull()?.clsName ?: "general"
+                    val primaryObjectId = filteredBoxes.firstOrNull()?.clsName ?: "general"
                     speakGuidance(guidance, primaryObjectId)
                 }
             } else {
@@ -497,9 +532,36 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         belowOccupied: Boolean,
         boxes: List<BoundingBox>
     ): String? {
-        // Cluster people (or other classes) by proximity/depth
+        // Centralized, optimized grouping by depth (single pass, sorted)
+        fun clusterByDepthFast(
+            boxes: List<BoundingBox>,
+            depthMap: Array<FloatArray>?,
+            threshold: Float
+        ): List<List<BoundingBox>> {
+            if (depthMap == null) return listOf(boxes)
+            val boxesWithDepth = boxes.mapNotNull { box ->
+                val depth = getBoxDepth(box, depthMap)
+                if (depth != null) Pair(box, depth) else null
+            }.sortedBy { it.second }
+            val clusters = mutableListOf<MutableList<BoundingBox>>()
+            var currentCluster = mutableListOf<BoundingBox>()
+            var lastDepth: Float? = null
+            for ((box, depth) in boxesWithDepth) {
+                if (lastDepth == null || kotlin.math.abs(depth - lastDepth) < threshold) {
+                    currentCluster.add(box)
+                } else {
+                    clusters.add(currentCluster)
+                    currentCluster = mutableListOf(box)
+                }
+                lastDepth = depth
+            }
+            if (currentCluster.isNotEmpty()) clusters.add(currentCluster)
+            return clusters
+        }
+
+        // Group people by depth
         val personBoxes = boxes.filter { it.clsName.startsWith("person") }
-        val personGroups = clusterByDepth(personBoxes, depthMap, 1.0f) // 1.0m threshold for grouping
+        val personGroups = clusterByDepthFast(personBoxes, depthMap, 2.0f) // 1.0m threshold
 
         if (personGroups.isNotEmpty()) {
             // Find the largest group and its region
@@ -510,47 +572,27 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             }
             val groupDistance = largestGroup?.let { group ->
                 group.mapNotNull { box ->
-                    depthMap?.let { depthArray ->
-                        val centerX = ((box.x1 + box.x2) / 2 * (depthArray[0].size - 1)).toInt()
-                        val centerY = ((box.y1 + box.y2) / 2 * (depthArray.size - 1)).toInt()
-                        if (centerY in depthArray.indices && centerX in depthArray[0].indices) {
-                            val rawDepthValue = depthArray[centerY][centerX]
-                            val scaleFactor = 0.0025f
-                            rawDepthValue * scaleFactor
-                        } else null
-                    }
+                    getBoxDepth(box, depthMap)
                 }.minOrNull()
             }
 
             if (largestGroup != null && largestGroup.size > 1 && groupDistance != null && groupDistance in 0.5f..5.0f) {
-                val distanceDescription = getDistanceDescription(groupDistance)
-                return "${largestGroup.size} people $groupRegion, $distanceDescription"
+                val distanceDescription = String.format("%.1f meters", groupDistance)
+                return "people $groupRegion $distanceDescription ahead"
             }
         }
 
-        // ...existing code for single object guidance...
+        // Single object guidance (most prominent)
         val primaryObject = boxes.maxByOrNull { it.cnf * it.w * it.h }
         val objectName = primaryObject?.clsName?.substringBefore("-") ?: "object"
-
-        // Get distance if available
+        val region = primaryObject?.clsName?.substringAfter("-") ?: "ahead"
         val distance = primaryObject?.let { box ->
-            depthMap?.let { depthArray ->
-                val centerX = ((box.x1 + box.x2) / 2 * (depthArray[0].size - 1)).toInt()
-                val centerY = ((box.y1 + box.y2) / 2 * (depthArray.size - 1)).toInt()
-                if (centerY in depthArray.indices && centerX in depthArray[0].indices) {
-                    val rawDepthValue = depthArray[centerY][centerX]
-                    val scaleFactor = 0.0025f
-                    rawDepthValue * scaleFactor
-                } else null
-            }
+            getBoxDepth(box, depthMap)
         }
-
-        // Only speak if object is within 0.5m–5m
         if (distance != null && (distance < 0.5f || distance > 5.0f)) {
             return null
         }
-
-        val distanceDescription = distance?.let { getDistanceDescription(it) } ?: "ahead"
+        val distanceDescription = distance?.let { String.format("%.1f meters", it) } ?: ""
 
         // Priority checks (safety first)
         when {
@@ -559,30 +601,38 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                 return "$objectName above, lower your head"
         }
 
+        // After the person group logic, always check for the closest object:
+        val closestBox = boxes.minByOrNull { getBoxDepth(it, depthMap) ?: Float.MAX_VALUE }
+        val closestDistance = closestBox?.let { getBoxDepth(it, depthMap) }
+        if (closestBox != null && closestDistance != null && closestDistance > 0f && closestDistance < 0.5f) {
+            val objectName = closestBox.clsName.substringBefore("-")
+            return "$objectName very 4close, stop!"
+        }
+
         return when {
             // Object on left - move right (and keep moving right if path isn't clear)
             leftOccupied && !rightOccupied ->
-                if (!centerOccupied) "$objectName left $distanceDescription, move right"
-                else "$objectName left and center $distanceDescription, move further right"
+                if (!centerOccupied) "$objectName left $distanceDescription ahead, move right"
+                else "$objectName left and center $distanceDescription ahead, move further right"
 
             // Object on right - move left (and keep moving left if path isn't clear)
             rightOccupied && !leftOccupied ->
-                if (!centerOccupied) "$objectName right $distanceDescription, move left"
-                else "$objectName right and center $distanceDescription, move further left"
+                if (!centerOccupied) "$objectName right $distanceDescription ahead, move left"
+                else "$objectName right and center $distanceDescription ahead, move further left"
 
             // Object in center - check sides and move to clearest path
             centerOccupied -> {
                 when {
-                    !leftOccupied && !rightOccupied -> "$objectName center $distanceDescription, move left or right"
-                    !leftOccupied -> "$objectName center $distanceDescription, move left"
-                    !rightOccupied -> "$objectName center $distanceDescription, move right"
-                    else -> "$objectName $distanceDescription blocking path, stop"
+                    !leftOccupied && !rightOccupied -> "$objectName center $distanceDescription ahead, move left or right"
+                    !leftOccupied -> "$objectName center $distanceDescription ahead, move left"
+                    !rightOccupied -> "$objectName center $distanceDescription ahead, move right"
+                    else -> "$objectName $distanceDescription ahead blocking path, stop"
                 }
             }
 
             // Objects on both sides but center is clear
             leftOccupied && rightOccupied && !centerOccupied ->
-                "Objects on both sides $distanceDescription, proceed carefully forward"
+                "Objects on both sides $distanceDescription ahead, proceed carefully forward"
 
             // No objects detected
             !leftOccupied && !centerOccupied && !rightOccupied && !aboveOccupied && !belowOccupied ->
@@ -602,49 +652,18 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         }
     }
 
-    // Helper function for clustering by depth
-    private fun clusterByDepth(
-        boxes: List<BoundingBox>,
-        depthMap: Array<FloatArray>?,
-        threshold: Float
-    ): List<List<BoundingBox>> {
-        val clusters = mutableListOf<MutableList<BoundingBox>>()
-        val visited = mutableSetOf<Int>()
-
-        for (i in boxes.indices) {
-            if (i in visited) continue
-            val boxA = boxes[i]
-            val depthA = getBoxDepth(boxA, depthMap)
-            val cluster = mutableListOf(boxA)
-            visited.add(i)
-            for (j in boxes.indices) {
-                if (j == i || j in visited) continue
-                val boxB = boxes[j]
-                val depthB = getBoxDepth(boxB, depthMap)
-                if (depthA != null && depthB != null && Math.abs(depthA - depthB) < threshold) {
-                    cluster.add(boxB)
-                    visited.add(j)
-                }
-            }
-            clusters.add(cluster)
-        }
-        return clusters
-    }
-
+    // Helper function for getting box depth (already present in your code)
     private fun getBoxDepth(box: BoundingBox, depthMap: Array<FloatArray>?): Float? {
         return depthMap?.let { depthArray ->
             val centerX = ((box.x1 + box.x2) / 2 * (depthArray[0].size - 1)).toInt()
             val centerY = ((box.y1 + box.y2) / 2 * (depthArray.size - 1)).toInt()
-            if (centerY in depthArray.indices && centerX in depthArray[0].indices) {
-                val rawDepthValue = depthArray[centerY][centerX]
-                val scaleFactor = 0.0025f
-                rawDepthValue * scaleFactor
-            } else null
+            val medianRaw = getMedianDepthPatch(depthArray, centerX, centerY, patchSize = 2)
+            medianRaw?.let { RawDepth(it).toMeters() }
         }
     }
 
     private val spokenObjectTimestamps = mutableMapOf<String, Long>()
-    private val OBJECT_ALERT_COOLDOWN_MS = 2000L // 5 seconds per object
+    private val OBJECT_ALERT_COOLDOWN_MS = 1000L // 5 seconds per object
     private var lastSpokenTime: Long = 0
     private val SPEECH_COOLDOWN_MS = 1000L // 3.5 seconds global debounce
 
@@ -670,6 +689,48 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         }
         if (depths.isEmpty()) return null
         return depths.sorted()[depths.size / 2]
+    }
+
+
+
+    @JvmInline
+    private value class RawDepth(val value: Float)
+
+    private inline fun RawDepth.toMeters(): Float = value * DEPTH_SCALE_FACTOR
+
+    private fun updateHud() {
+        val det = lastDetectionInferenceTime
+        val dep = lastDepthInferenceTime
+        val lag = lastLagMs
+        val depthAgeMs = if (depthSourceTimestampMs > 0L) System.currentTimeMillis() - depthSourceTimestampMs else -1L
+
+        fun speedLabel(ms: Long, fast: Long, slow: Long): String {
+            return when {
+                ms <= fast -> "fast"
+                ms <= slow -> "ok"
+                else -> "slow"
+            }
+        }
+
+        val detLabel = speedLabel(det, fast = 30, slow = 60)
+        val depLabel = speedLabel(dep, fast = 40, slow = 100)
+        val lagLabel = speedLabel(lag, fast = 80, slow = 150)
+        val ageLabel = if (depthAgeMs >= 0) speedLabel(depthAgeMs, fast = 80, slow = 160) else "n/a"
+
+        val statusPriority = mapOf("fast" to 0, "ok" to 1, "slow" to 2)
+        val worstLabel = listOf(detLabel, depLabel, lagLabel, ageLabel).maxByOrNull { statusPriority[it] ?: 0 } ?: "ok"
+        val color = when (worstLabel) {
+            "fast" -> Color.GREEN
+            "ok" -> Color.YELLOW
+            else -> Color.RED
+        }
+
+        binding.inferenceTime.setTextColor(color)
+        val ageText = if (depthAgeMs >= 0) "\nDepthAge: ${depthAgeMs}ms (${ageLabel})" else ""
+        binding.inferenceTime.isSingleLine = false
+        binding.inferenceTime.maxLines = 4
+        binding.inferenceTime.textAlignment = View.TEXT_ALIGNMENT_VIEW_START
+        binding.inferenceTime.text = "Det: ${det}ms (${detLabel})\nDepth: ${dep}ms (${depLabel})\nLag: ${lag}ms (${lagLabel})${ageText}"
     }
 }
 

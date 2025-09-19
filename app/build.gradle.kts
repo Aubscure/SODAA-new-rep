@@ -37,6 +37,11 @@ android {
     buildFeatures {
         viewBinding = true
     }
+
+    // Ensure .tflite assets are not compressed so they can be memory-mapped
+    androidResources {
+        noCompress += "tflite"
+    }
 }
 
 dependencies {

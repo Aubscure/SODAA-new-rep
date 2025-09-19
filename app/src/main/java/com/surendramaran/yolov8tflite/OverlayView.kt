@@ -95,13 +95,15 @@ class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs
                 if (depthArray != null) {
                     val centerX = ((box.x1 + box.x2) / 2 * (depthArray[0].size - 1)).toInt()
                     val centerY = ((box.y1 + box.y2) / 2 * (depthArray.size - 1)).toInt()
-
-                    // Revert to single center pixel sampling
                     if (centerY in depthArray.indices && centerX in depthArray[0].indices) {
                         val rawDepthValue = depthArray[centerY][centerX]
                         val scaleFactor = 0.0025f  // Adjust this based on your model
                         val meters = rawDepthValue * scaleFactor
-                        depthLabel = String.format("%.1f m", meters)
+                        depthLabel = if (meters in 0.5f..5.0f) {
+                            String.format("%.1f m (raw %.1f)", meters, rawDepthValue)
+                        } else {
+                            "out of range (raw %.1f)".format(rawDepthValue)
+                        }
                     }
                 }
             } catch (e: Exception) {

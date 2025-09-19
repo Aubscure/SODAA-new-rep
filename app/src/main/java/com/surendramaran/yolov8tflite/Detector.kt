@@ -9,6 +9,7 @@ import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
 import org.tensorflow.lite.gpu.GpuDelegate
+import org.tensorflow.lite.nnapi.NnApiDelegate
 import org.tensorflow.lite.support.common.FileUtil
 import org.tensorflow.lite.support.common.ops.CastOp
 import org.tensorflow.lite.support.common.ops.NormalizeOp
@@ -38,15 +39,34 @@ class Detector(
         .build()
 
     init {
-        val compatList = CompatibilityList()
+        val options = Interpreter.Options()
+        var delegateAdded = false
 
-        val options = Interpreter.Options().apply {
+        // Try NNAPI (NPU) first
+        try {
+            val nnApiDelegate = NnApiDelegate()
+            options.addDelegate(nnApiDelegate)
+            delegateAdded = true
+            message("Using NNAPI delegate (NPU) for detection")
+        } catch (e: Exception) {
+            message("NNAPI delegate not available: ${e.message}")
+        }
+
+        // If NNAPI not available, try GPU
+        if (!delegateAdded) {
+            val compatList = CompatibilityList()
             if (compatList.isDelegateSupportedOnThisDevice) {
                 val delegateOptions = compatList.bestOptionsForThisDevice
-                this.addDelegate(GpuDelegate(delegateOptions))
-            } else {
-                this.setNumThreads(4)
+                options.addDelegate(GpuDelegate(delegateOptions))
+                delegateAdded = true
+                message("Using GPU delegate for detection")
             }
+        }
+
+        // If neither, use CPU
+        if (!delegateAdded) {
+            options.setNumThreads(4)
+            message("Using CPU for detection")
         }
 
         val model = FileUtil.loadMappedFile(context, modelPath)
@@ -85,14 +105,34 @@ class Detector(
     fun restart() {
         interpreter.close()
 
-        val compatList = CompatibilityList()
-        val options = Interpreter.Options().apply {
+        val options = Interpreter.Options()
+        var delegateAdded = false
+
+        // Try NNAPI (NPU) first
+        try {
+            val nnApiDelegate = NnApiDelegate()
+            options.addDelegate(nnApiDelegate)
+            delegateAdded = true
+            message("Using NNAPI delegate (NPU) for detection")
+        } catch (e: Exception) {
+            message("NNAPI delegate not available: ${e.message}")
+        }
+
+        // If NNAPI not available, try GPU
+        if (!delegateAdded) {
+            val compatList = CompatibilityList()
             if (compatList.isDelegateSupportedOnThisDevice) {
                 val delegateOptions = compatList.bestOptionsForThisDevice
-                this.addDelegate(GpuDelegate(delegateOptions))
-            } else {
-                this.setNumThreads(4)
+                options.addDelegate(GpuDelegate(delegateOptions))
+                delegateAdded = true
+                message("Using GPU delegate for detection")
             }
+        }
+
+        // If neither, use CPU
+        if (!delegateAdded) {
+            options.setNumThreads(4)
+            message("Using CPU for detection")
         }
 
         val model = FileUtil.loadMappedFile(context, modelPath)
@@ -246,7 +286,7 @@ class Detector(
         private const val INPUT_STANDARD_DEVIATION = 255f
         private val INPUT_IMAGE_TYPE = DataType.FLOAT32
         private val OUTPUT_IMAGE_TYPE = DataType.FLOAT32
-        private const val CONFIDENCE_THRESHOLD = 0.5F // Increased from 0.3F to 0.5F
+        private const val CONFIDENCE_THRESHOLD = 0.3F // Increased from 0.3F to 0.5F
         private const val IOU_THRESHOLD = 0.5F
     }
 }
